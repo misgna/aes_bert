@@ -11,8 +11,8 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        essay = self.data.iloc[idx]['essay']
-        score = self.data.iloc[idx]['score']
+        essay = self.data.iloc[idx]['essay_text']
+        score = self.data.iloc[idx]['overall']
         encoding = self.tokenizer(
             essay,
             truncation=True,
