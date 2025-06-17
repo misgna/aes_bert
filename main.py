@@ -1,96 +1,120 @@
-import pandas as pd
+import argparse
 import numpy as np
-import random
+from tqdm import tqdm
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch import nn
-from torch.optim import AdamW
 
-from sklearn.metrics import cohen_kappa_score
-
-from transformers import BertModel, BertTokenizer, BertConfig
-
-from bert_model import BERTRegressor
+from model import BERTRegressor
 from custom_dataset import CustomDataset
+from utils import load_asap_data, load_asap_data_cross, load_leaf_data, evaluate_qwk
 
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+def set_seed(seed):
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def training(model, dataloader, optimizer, loss_fn, epochs, desc):
+    model.train()
     
-def load_data(filepath):
-    return pd.read_csv(filepath)
-
-def training(model, train_loader, device, optimizer, loss_fn, EPOCHS):
-    for epoch in range(EPOCHS):
-        model.train()
-        for batch in train_loader:
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in tqdm(dataloader, desc=desc):
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-
-            outputs = model(input_ids, attention_mask)
+            features = batch['features'].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, features=features)
+            
             loss = loss_fn(outputs, labels)
             loss.backward()
             optimizer.step()
-    
-        print(f"Epoch {epoch+1}, Training Loss: {loss.item():.4f}")
+            total_loss += loss.item()
+            
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch + 1}, Training Loss: {total_loss}")
 
-def validation(model, dev_loader, device):
+def validation(model, dataloader, desc):
     model.eval()
-    preds, trues = [], []
+    all_preds, all_labels = [], []
     with torch.no_grad():
-        for batch in dev_loader:
+        for batch in tqdm(dataloader, desc=desc):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            labels = batch['labels'].numpy()
+            features = batch['features'].to(device)
 
-            outputs = model(input_ids, attention_mask)
-            preds.extend(outputs.cpu().numpy())
-            trues.extend(labels.cpu().numpy())
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, features=features)
+            preds = outputs.squeeze().cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels)
 
-    qwk = cohen_kappa_score(trues, preds, weights="quadratic")
-    print(f"QWK: {qwk:.4f}")
+    return all_labels, all_preds
+
+def main():
+    parser = argparse.ArgumentParser(description="BERT-based holistic AES")
+    parser.add_argument('--dataset', type=str, help='For dataset input asap (asap for prompt-specific), cross(asap for cross-prompt) or leaf')
+    parser.add_argument('--prompt', type=int, default=1, help='Choose from 1-8 for asap or 9 for leaf')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=5, help="Number of epochs")
+    args = parser.parse_args()
+    
+    return args.dataset, args.prompt, args.batch_size, args.epochs
 
 if __name__ == "__main__":
+    seed_list = [12, 22, 32, 42, 52]
     set_seed(42)
-    train_df = load_data("datasets/xLEAF/train.csv")
-    dev_df = load_data("datasets/xLEAF/dev.csv")
-    #print(dev_df)
     
-    EPOCHS = 2
-    LR = 2e-5 # learning rate
-    BATCH_SIZE = 4
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    train_dataset = CustomDataset(train_df, tokenizer)
-    dev_dataset = CustomDataset(dev_df, tokenizer)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    dev_loader = DataLoader(dev_dataset, batch_size=BATCH_SIZE)
-
-    model = BERTRegressor().to(device)
-    optimizer = AdamW(model.parameters(), lr=LR)
+    dataset, prompt, batch_size, epochs = main()
     loss_fn = nn.MSELoss()
+    learning_rate = 2e-5 # learning rate
+    
+    data_folds = []
+    
+    if dataset == 'asap':
+        data_folds = load_asap_data(prompt)
+    elif dataset == 'cross':
+        data_folds = load_asap_data_cross(prompt)
+    elif dataset == 'leaf':
+        prompt = 9
+        data_folds = load_leaf_data(prompt)    
 
-    # call training method
-    training(model, train_loader, device, optimizer, loss_fn, EPOCHS)
+    test_qwks = []
     
-    # call calidation method
-    validation(model, dev_loader, device)
-    
-    # save model and tokenizer
-    #model.save_pretrained("bert_ft")
-    #tokenizer.save_pretrained("bert_ft")
+    for fold in data_folds:
+        model = BERTRegressor().to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        train, val, test = fold
+        
+        train_ds = CustomDataset(train['essay'].to_list(), train['score'].to_list(), train['features'])
+        val_ds = CustomDataset(val['essay'].to_list(), val['score'].to_list(), val['features'])
+        test_ds = CustomDataset(test['essay'].to_list(), test['score'].to_list(), test['features'])
+        
+        train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        
+        training(model, train_dl,  optimizer, loss_fn, epochs, "Training")
+        
+        labels, preds = validation(model, val_dl, "Validation")
+        
+        qwk = evaluate_qwk(preds, labels, prompt)
+        print(f'QWK: {qwk}')
+        
+        # Collect test results
+        labels_test, preds_test = validation(model, test_dl, "Testing")
+        qwk_test = evaluate_qwk(preds_test, labels_test, prompt)
+        test_qwks.append(qwk_test)
+        
+    print('--' * 10)
+    for (index, qwk) in enumerate(test_qwks):
+        print(f'Fold {index}: {qwk}')
+        
+    print(f'Avg QWK: {sum(test_qwks) / len(test_qwks)}')
     
     

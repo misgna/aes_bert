@@ -1,25 +1,20 @@
 import torch
 from torch.utils.data import Dataset
+from transformers import BertTokenizer
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 class CustomDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, max_length=512):
-        self.data = dataframe
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+    def __init__(self, essays, scores, features):
+        self.encodings = tokenizer(essays, padding=True, truncation=True, return_tensors='pt')
+        self.scores = torch.tensor(scores, dtype=torch.float)
+        self.features = torch.tensor(features, dtype=torch.float)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.scores)
 
     def __getitem__(self, idx):
-        essay = self.data.iloc[idx]['essay_text']
-        score = self.data.iloc[idx]['overall']
-        encoding = self.tokenizer(
-            essay,
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-        item = {key: val.squeeze(0) for key, val in encoding.items()}
-        item['labels'] = torch.tensor(score, dtype=torch.float)
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item['labels'] = self.scores[idx]
+        item['features'] = self.features[idx]
         return item
